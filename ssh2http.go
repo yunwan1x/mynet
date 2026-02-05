@@ -1167,7 +1167,7 @@ func (m *SSHManager) dialSSH() (*ssh.Client, error) {
 
 // 保活协程
 func (m *SSHManager) keepAlive(client *ssh.Client) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
