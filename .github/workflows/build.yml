@@ -1,0 +1,246 @@
+# .github/workflows/build.yml
+name: Build and Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+env:
+  BINARY_NAME: ssh2http
+  DOCKER_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ─────────────────────────────────────────
+  # 编译多平台二进制
+  # ─────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Linux
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: linux
+            goarch: 386
+            suffix: linux-386
+          - goos: linux
+            goarch: arm
+            goarm: 7
+            suffix: linux-armv7
+
+          # macOS
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+
+          # Windows
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64
+            ext: .exe
+          - goos: windows
+            goarch: 386
+            suffix: windows-386
+            ext: .exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          COMMIT=${GITHUB_SHA::8}
+
+          OUTPUT="${BINARY_NAME}-${VERSION}-${{ matrix.suffix }}${{ matrix.ext }}"
+
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME} -X main.commit=${COMMIT}" \
+            -o "${OUTPUT}" \
+            ssh2http.go
+
+          # 生成校验和
+          sha256sum "${OUTPUT}" > "${OUTPUT}.sha256"
+
+          echo "OUTPUT=${OUTPUT}" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
+          path: |
+            ${{ env.OUTPUT }}
+            ${{ env.OUTPUT }}.sha256
+
+  # ─────────────────────────────────────────
+  # 构建 Docker 多架构镜像
+  # ─────────────────────────────────────────
+  docker:
+    name: Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-linux-amd64
+          path: dist/linux-amd64/
+
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-linux-arm64
+          path: dist/linux-arm64/
+
+      - name: Prepare binaries
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+
+          mkdir -p docker/linux/amd64 docker/linux/arm64
+
+          cp dist/linux-amd64/${BINARY_NAME}-${VERSION}-linux-amd64 docker/linux/amd64/${BINARY_NAME}
+          cp dist/linux-arm64/${BINARY_NAME}-${VERSION}-linux-arm64 docker/linux/arm64/${BINARY_NAME}
+
+          chmod +x docker/linux/amd64/${BINARY_NAME}
+          chmod +x docker/linux/arm64/${BINARY_NAME}
+
+      - name: Generate Dockerfile
+        run: |
+          cat > Dockerfile <<'EOF'
+          FROM --platform=$BUILDPLATFORM alpine:3.20 AS base
+          RUN apk add --no-cache ca-certificates tzdata
+
+          FROM scratch
+          COPY --from=base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+          COPY --from=base /usr/share/zoneinfo /usr/share/zoneinfo
+          ARG TARGETOS
+          ARG TARGETARCH
+          COPY docker/${TARGETOS}/${TARGETARCH}/ssh2http /ssh2http
+          ENTRYPOINT ["/ssh2http"]
+          EOF
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # ─────────────────────────────────────────
+  # 发布 Release（仅 tag 触发）
+  # ─────────────────────────────────────────
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: false
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+
+          # 把所有产物平铺到 release 目录
+          find dist/ -type f \( -name "${BINARY_NAME}-*" \) -exec cp {} release/ \;
+
+          # 生成总校验和文件
+          cd release
+          sha256sum ${BINARY_NAME}-* > checksums.txt
+          cat checksums.txt
+
+          echo "--- Release files ---"
+          ls -lh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*
+          body: |
+            ## Docker 镜像
+
+            ```bash
+            docker pull ${{ env.DOCKER_IMAGE }}:${{ github.ref_name }}
+            ```
+
+            ## 校验和
+
+            下载后验证:
+            ```bash
+            sha256sum -c checksums.txt
+            ```
