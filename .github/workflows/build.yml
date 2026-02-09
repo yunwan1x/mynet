@@ -80,7 +80,7 @@ jobs:
           COMMIT=${GITHUB_SHA::8}
 
           OUTPUT="${BINARY_NAME}-${VERSION}-${{ matrix.suffix }}${{ matrix.ext }}"
-
+          go mod tidy
           go build \
             -trimpath \
             -ldflags "-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME} -X main.commit=${COMMIT}" \
