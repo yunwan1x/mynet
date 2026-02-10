@@ -207,10 +207,8 @@ func NewSSHManager(sshHost, sshUser, sshPassword, sshKeyFile, sshConfigFile, ssh
 	return m
 }
 
-// getSSHClient 获取健康的SSH客户端
-// 如果当前连接健康，直接返回（无额外检测开销）
-// 如果不健康，触发重连并等待结果
-func (m *SSHManager) getSSHClient() (*ssh.Client, error) {
+// getSSHClient 获取健康的SSH客户端，同时返回 generation 用于后续验证
+func (m *SSHManager) getSSHClient() (*ssh.Client, uint64, error) {
 	m.mu.RLock()
 	client := m.client
 	healthy := m.healthy
@@ -218,11 +216,21 @@ func (m *SSHManager) getSSHClient() (*ssh.Client, error) {
 	m.mu.RUnlock()
 
 	if client != nil && healthy {
-		return client, nil
+		return client, gen, nil
 	}
 
 	// 需要重连，触发并等待
-	return m.triggerReconnect(gen)
+	client, err := m.triggerReconnect(gen)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// 重连成功后重新读取 generation
+	m.mu.RLock()
+	gen = m.generation
+	m.mu.RUnlock()
+
+	return client, gen, nil
 }
 
 // triggerReconnect 触发重连，确保只有一个goroutine执行重连逻辑
@@ -230,7 +238,7 @@ func (m *SSHManager) getSSHClient() (*ssh.Client, error) {
 func (m *SSHManager) triggerReconnect(failedGen uint64) (*ssh.Client, error) {
 	m.reconnectMu.Lock()
 
-	// 检查是否已经有更新的连接（其他goroutine已完成重连）
+	// 检查是否已经有更新的连接
 	m.mu.RLock()
 	if m.client != nil && m.healthy && m.generation > failedGen {
 		client := m.client
@@ -241,12 +249,10 @@ func (m *SSHManager) triggerReconnect(failedGen uint64) (*ssh.Client, error) {
 	m.mu.RUnlock()
 
 	if m.reconnecting {
-		// 已有goroutine在重连，等待完成
 		log.Println("Waiting for ongoing reconnection...")
 		m.reconnectCond.Wait()
 		m.reconnectMu.Unlock()
 
-		// 重连完成，获取结果
 		m.mu.RLock()
 		client := m.client
 		healthy := m.healthy
@@ -258,14 +264,11 @@ func (m *SSHManager) triggerReconnect(failedGen uint64) (*ssh.Client, error) {
 		return nil, fmt.Errorf("reconnection completed but no healthy client available")
 	}
 
-	// 标记为正在重连
 	m.reconnecting = true
 	m.reconnectMu.Unlock()
 
-	// 执行重连
 	client, err := m.doReconnect()
 
-	// 重连完成，通知所有等待者
 	m.reconnectMu.Lock()
 	m.reconnecting = false
 	m.reconnectCond.Broadcast()
@@ -447,13 +450,12 @@ func (m *SSHManager) sendKeepAliveWithTimeout(client *ssh.Client, timeout time.D
 	}
 }
 
-// dialWithRetry 通过SSH客户端拨号到目标，带智能错误判断
-// 返回: 目标连接, 是否需要重建SSH, 错误
+// dialTarget 通过SSH客户端拨号到目标，带 generation 检测和自动重试
 func (m *SSHManager) dialTarget(target string) (net.Conn, error) {
-	maxRetries := 2
+	maxRetries := 3
 
 	for retry := 0; retry < maxRetries; retry++ {
-		client, err := m.getSSHClient()
+		client, gen, err := m.getSSHClient()
 		if err != nil {
 			return nil, fmt.Errorf("get SSH client: %w", err)
 		}
@@ -463,17 +465,40 @@ func (m *SSHManager) dialTarget(target string) (net.Conn, error) {
 			return conn, nil
 		}
 
-		// 关键判断：是SSH连接问题还是目标不可达？
-		if isSSHConnectionError(err) {
-			log.Printf("SSH connection error dialing %s (attempt %d/%d): %v", target, retry+1, maxRetries, err)
-			gen := m.markUnhealthy(fmt.Sprintf("dial error: %v", err))
-			_ = gen
-			// 继续重试，getSSHClient会触发重连
+		// Dial 失败，先检查 generation 是否已经变了
+		// 如果变了，说明 client 在 Dial 期间被 keepAlive 或其他 goroutine 关闭了
+		// 这正是 "use of closed network connection" 的典型场景
+		m.mu.RLock()
+		currentGen := m.generation
+		currentHealthy := m.healthy
+		m.mu.RUnlock()
+
+		if currentGen != gen {
+			// client 已经被替换或关闭，直接重试拿新 client
+			log.Printf("[dialTarget] SSH client changed during dial to %s (gen %d→%d), retrying (%d/%d)",
+				target, gen, currentGen, retry+1, maxRetries)
 			continue
 		}
 
-		// 目标不可达，不是SSH的问题，直接返回错误
-		log.Printf("Target %s unreachable (not SSH issue): %v", target, err)
+		if !currentHealthy {
+			// generation 没变但已标记不健康，说明 keepAlive 刚标记的
+			// 重试时 getSSHClient 会触发重连
+			log.Printf("[dialTarget] SSH client unhealthy during dial to %s (gen %d), retrying (%d/%d)",
+				target, gen, retry+1, maxRetries)
+			continue
+		}
+
+		// generation 没变且仍标记健康，判断是 SSH 连接问题还是目标不可达
+		if isSSHConnectionError(err) {
+			log.Printf("[dialTarget] SSH connection error dialing %s (gen %d, attempt %d/%d): %v",
+				target, gen, retry+1, maxRetries, err)
+			m.markUnhealthy(fmt.Sprintf("dial error: %v", err))
+			// 重试时 getSSHClient 会触发重连
+			continue
+		}
+
+		// 目标不可达，不是 SSH 的问题，直接返回
+		log.Printf("[dialTarget] Target %s unreachable (not SSH issue): %v", target, err)
 		return nil, fmt.Errorf("target unreachable: %w", err)
 	}
 
