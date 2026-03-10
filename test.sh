@@ -10,9 +10,9 @@
 BINARY="./ssh2http"
 
 # 场景1: 直连 - 用户名密码
-SSH_HOST="8.210.191.242:22"
+SSH_HOST=""
 SSH_USER="root"
-SSH_PASSWORD="FqfB*XecY8mb9"
+SSH_PASSWORD=""
 
 # 场景2: 直连 - 密钥
 SSH_KEY="~/.ssh/id_rsa"
